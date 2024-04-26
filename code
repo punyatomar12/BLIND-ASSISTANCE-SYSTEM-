@@ -1,0 +1,213 @@
+from detectron2.engine import DefaultPredictor
+from detectron2.config import get_cfg
+from detectron2.utils.visualizer import Visualizer
+from detectron2.data import MetadataCatalog
+from detectron2 import model_zoo
+import numpy as np
+import cv2
+
+# Load the panoptic segmentation model and predictor here
+cfg = get_cfg()
+cfg.MODEL.DEVICE = "cpu"
+
+cfg.merge_from_file(model_zoo.get_config_file("COCO-PanopticSegmentation/panoptic_fpn_R_101_3x.yaml"))
+cfg.MODEL.WEIGHTS = model_zoo.get_checkpoint_url("COCO-PanopticSegmentation/panoptic_fpn_R_101_3x.yaml")
+
+predictor = DefaultPredictor(cfg)
+
+# Load the navigable path extraction function here
+navigable_class_id = 43
+stairs_class_id = 27
+
+# Load an example video (you need to provide the video path)
+video_path = "vid22.mp4"  # Replace with your video path
+cap = cv2.VideoCapture(video_path)
+
+#import imageio
+def extract_navigable_path(panoptic_seg, segments_info, navigable_class_id):
+    navigable_mask = np.zeros_like(panoptic_seg)
+    for segment_info in segments_info:
+        if segment_info["category_id"] == navigable_class_id:
+            segment_id = segment_info["id"]
+            navigable_mask[panoptic_seg == segment_id] = 1
+    return navigable_mask
+
+#cap = imageio.get_reader(video_path)
+
+# Define the output video settings
+output_path = "blind_project_result1.mp4"
+frame_width = int(cap.get(3))
+frame_height = int(cap.get(4))
+out = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*"mp4v"), 10, (frame_width, frame_height))
+
+arrow_center = (frame_width // 2, frame_height - 30)
+arrow_length = 40
+arrow_color = (0, 255, 0)  # 
+
+# Define the region of interest dimensions
+roi_width = 200  # Specify the width of the region of interest
+roi_height = 200  # Specify the height of the region of interest
+if cap.isOpened():
+    print("video capture is working")
+    #break
+
+while cap.isOpened():
+    ret, frame = cap.read()
+    print("Reading frame:", ret)
+    if not ret:
+        break
+
+    # Define the image dimensions
+    image_width = frame.shape[1]
+    image_height = frame.shape[0]
+
+    # Create an empty grid
+    grid = np.zeros((image_height, image_width), dtype=bool)
+
+    # Set the ROI (region of interest) to True
+    start_x = (image_width - roi_width) // 2
+    end_x = start_x + roi_width
+    start_y = image_height - roi_height
+    end_y = image_height
+    grid[start_y:end_y, start_x:end_x] = True
+
+    # Define the navigable path mask and perform other processing here
+    panoptic_seg, segments_info = predictor(frame)["panoptic_seg"]
+    navigable_mask = extract_navigable_path(panoptic_seg, segments_info, navigable_class_id)
+
+    stairs_mask = np.zeros_like(panoptic_seg)
+    for segment_info in segments_info:
+        if segment_info["category_id"] == stairs_class_id:
+            segment_id = segment_info["id"]
+            stairs_mask[panoptic_seg == segment_id] = 1
+    overlay = np.zeros_like(frame)
+    overlay[navigable_mask] = [0, 0, 255]  # Red color for navigable path
+    overlay[grid] = [255, 0, 0]  # Blue color for grid
+
+    # Blend the overlay with the original frame
+    output_frame = cv2.addWeighted(frame, 0.7, overlay, 0.3, 0)
+
+    stairs_in_roi = np.any(stairs_mask[start_y:end_y, start_x:end_x])
+    if stairs_in_roi:
+        result_text = "Stairs detected ahead."
+        # Load the image
+        stairs = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+    # Apply Gaussian blur for noise reduction
+        blurred = cv2.GaussianBlur(stairs, (5, 5), 0)
+
+    # Perform edge detection using the Canny edge detector
+        edges = cv2.Canny(blurred, 50, 150)
+
+    # Perform line detection using the Hough Transform
+        lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=100, minLineLength=100, maxLineGap=10)
+
+    # Calculate the mean orientation of detected lines
+        orientations = []
+        for line in lines:
+            x1, y1, x2, y2 = line[0]
+            angle = np.arctan2(y2 - y1, x2 - x1) * 180 / np.pi
+            orientations.append(angle)
+
+        mean_orientation = np.mean(orientations)
+
+# Define a threshold to determine the predominant direction
+        threshold_angle = 45
+
+        if abs(mean_orientation) < threshold_angle:
+            direction = "Up"
+        else:
+            direction = "Down"
+
+        cv2.putText(output_frame, "{} stairs ahead".format(direction), (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+        
+        
+    else:
+        result_text = "No stairs detected in the ROI."
+
+    # Overlay the navigable mask and grid on the frame
+    
+
+    # Check if any navigable path segment is present in the ROI
+    non_navigable_pixels = ~navigable_mask[start_y:end_y, start_x:end_x] & grid[start_y:end_y, start_x:end_x]
+
+    if np.any(non_navigable_pixels):
+        print("Person cannot move forward.")
+        half_width = grid.shape[1] // 2
+
+        can_move_forward=False
+
+        # Divide the grid into two halves (left and right)
+        half_width = grid.shape[1] // 2
+
+        left_half = grid[:, :half_width]
+        right_half = grid[:, half_width:]
+
+# Check left half for navigable path
+        left_half_start_x = 0
+        left_half_end_x = half_width
+
+        left_half_navigable_mask = navigable_mask[:, left_half_start_x:left_half_end_x]
+        left_half_grid = left_half
+
+        left_non_navigable_pixels = ~left_half_navigable_mask & left_half_grid
+
+        if np.any(left_non_navigable_pixels):
+            left=False
+            print("Object detected on the left. Move right.")
+        else:
+            left=True
+            print("Left half: Person can move forward.")
+
+        cv2.putText(output_frame, "Can move left :{}".format(left), (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+
+# Check right half for navigable path
+        right_half_start_x = half_width
+        right_half_end_x = grid.shape[1]
+
+        right_half_navigable_mask = navigable_mask[:, right_half_start_x:right_half_end_x]
+        right_half_grid = right_half
+
+        right_non_navigable_pixels = ~right_half_navigable_mask & right_half_grid
+
+        if np.any(right_non_navigable_pixels):
+            print("Right half: Person cannot move forward.")
+            right=False
+            
+        else:
+            right=True
+            print("Right half: Person can move forward.")
+
+        cv2.putText(output_frame, "Can move right :{}".format(right), (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+
+        if (right == False) and (left == False):
+            cv2.putText(output_frame, "!!!STOP!!!", (50, 200), cv2.FONT_HERSHEY_SIMPLEX, 3, (0, 255, 0), 2)
+            
+
+
+        
+        
+    else:
+        print("Person can move forward.")
+        can_move_forward=True
+
+    # Write the processed frame to the output video
+    cv2.putText(output_frame, "Can move :{}".format(can_move_forward), (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+    arrow_frame = output_frame.copy()
+    if can_move_forward:
+        arrow_tip = (arrow_center[0], arrow_center[1] - arrow_length)
+        cv2.arrowedLine(arrow_frame, arrow_center, arrow_tip, arrow_color, 5)
+    elif left:
+        arrow_tip = (arrow_length, frame_height - arrow_length)
+        cv2.arrowedLine(arrow_frame, arrow_center, arrow_tip, arrow_color, 5)
+    elif right:
+        arrow_tip = (frame_width - arrow_length, frame_height - arrow_length)
+        cv2.arrowedLine(arrow_frame, arrow_center, arrow_tip, arrow_color, 5)
+
+
+    out.write(arrow_frame)
+
+cap.release()
+out.release()
+
+
